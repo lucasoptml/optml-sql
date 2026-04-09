@@ -47,10 +47,12 @@ def generate_drizzle_schema(xml_file):
     
     root = tree.getroot()
     # Updated imports now include `sql`
-    drizzle_imports = ("import { pgTable, serial, uuid, text, integer, boolean, "
-                         "timestamp, date, json, jsonb, decimal, primaryKey, foreignKey } "
-                         "from 'drizzle-orm/pg-core';\n"
-                         "import { sql } from 'drizzle-orm';\n\n")
+    drizzle_imports = (
+        "import { pgTable, serial, uuid, text, integer, boolean, "
+        "timestamp, date, json, jsonb, decimal, primaryKey, foreignKey } "
+        "from 'drizzle-orm/pg-core';\n"
+        "import { sql } from 'drizzle-orm';\n\n"
+    )
     table_definitions = []
     exports = []
     
@@ -60,9 +62,13 @@ def generate_drizzle_schema(xml_file):
             if not table_name:
                 sys.stderr.write("Warning: <addTable> without a name attribute.\n")
                 continue
-                
+            
+            # Determine if history logging is enabled for this table.
+            is_history = command.attrib.get('history', 'false').lower() in ['true', 'yes', '1']
+            
             columns = []
             foreign_keys = []
+            primary_key_field = None  # (columnName, drizzleType)
             
             for child in command:
                 if child.tag == 'addColumn':
@@ -90,7 +96,7 @@ def generate_drizzle_schema(xml_file):
                     if type_options:
                         col_def += f", {type_options}"
                     col_def += ")"
-
+                    
                     # Add nullability: if nullable is "false", add .notNull(), otherwise do nothing.
                     nullable_attr = child.attrib.get('nullable', 'true').lower()
                     if nullable_attr == 'false':
@@ -111,14 +117,17 @@ def generate_drizzle_schema(xml_file):
                             if drizzle_type in ['text', 'varchar']:
                                 if not (default_val.startswith("'") or default_val.startswith('"')):
                                     default_val = f"'{default_val}'"
-                            col_def += f".default({default_val})"                    
+                            col_def += f".default({default_val})"
                     
                     if child.attrib.get('primaryKey', 'false').lower() == 'true':
                         col_def += ".primaryKey()"
-
+                        if primary_key_field is None:
+                            # Store primary key field and its drizzle type.
+                            primary_key_field = (col_name, drizzle_type)
+                    
                     col_def += ","
                     columns.append(col_def)        
-
+                
                 """ disable foreign key support for now, could add it
                 elif child.tag == 'addForeignKey':
                     fk_col = child.attrib.get('column')
@@ -150,6 +159,36 @@ def generate_drizzle_schema(xml_file):
             
             table_definitions.append(table_def)
             exports.append(table_name)
+            
+            # Generate history table if history is enabled
+            if is_history:
+                hist_table_name = f"history_{table_name}"
+                hist_columns = []
+                
+                # Add history table specific columns
+                hist_columns.append(f"  historyid: serial('historyid').primaryKey(),")
+                
+                # Add primarykey field if there is one
+                if primary_key_field:
+                    pk_name, pk_type = primary_key_field
+                    # Use integer if primary key type is serial
+                    if pk_type == 'serial':
+                        hist_columns.append(f"  primarykey: integer('primarykey'),")
+                    else:
+                        hist_columns.append(f"  primarykey: {pk_type}('primarykey'),")
+                
+                # Add other standard history columns
+                hist_columns.append(f"  changed_at: timestamp('changed_at', {{ withTimezone: true }}).defaultNow(),")
+                hist_columns.append(f"  operation: text('operation'),")
+                hist_columns.append(f"  historyjson: jsonb('historyjson'),")
+                
+                # Create history table definition
+                hist_table_def = f"export const {hist_table_name} = pgTable('{hist_table_name}', {{\n"
+                hist_table_def += "\n".join(hist_columns)
+                hist_table_def += "\n});\n"
+                
+                table_definitions.append(hist_table_def)
+                exports.append(hist_table_name)
     
     # Create exports statement
     # not needed, redudant: export_statement = f"export {{ {', '.join(exports)} }};\n"

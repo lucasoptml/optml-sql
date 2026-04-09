@@ -41,6 +41,9 @@ def generate_sql(xml_file):
             foreign_keys = []
             effective_columns = OrderedDict()
 
+            # Variable to store the primary key field (name and type) if defined.
+            primary_key_field = None
+
             # Process child elements of <addTable>
             for child in command:
                 if child.tag == 'addColumn':
@@ -54,20 +57,25 @@ def generate_sql(xml_file):
                     col_def_parts = [f"{col_name} {col_type}"]
                     if child.attrib.get('primaryKey', 'false').lower() == 'true':
                         col_def_parts.append("PRIMARY KEY")
+                        # Record the primary key field if not already set.
+                        if primary_key_field is None:
+                            primary_key_field = (col_name, col_type)
                     # If nullable is provided and explicitly false, add NOT NULL
                     if child.attrib.get('nullable', 'true').lower() == 'false':
                         col_def_parts.append("NOT NULL")
                     if child.attrib.get('default') is not None:
                         col_def_parts.append(f"DEFAULT {child.attrib.get('default')}")
                     col_def = " ".join(col_def_parts)
-                    effective_columns[col_name] = col_def
+                    # Track nohistory flag for trigger generation
+                    nohistory = child.attrib.get('nohistory', 'false').lower() == 'true'
+                    effective_columns[col_name] = {'def': col_def, 'nohistory': nohistory}
 
                     # Generate an ALTER TABLE command to add the column if it doesn't exist
                     alter_ops.append(f"ALTER TABLE {qualified_table} ADD COLUMN IF NOT EXISTS {col_def};")
 
                     # Check for unique attribute and add UNIQUE if true
                     if child.attrib.get('unique', 'false').lower() == 'true':
-                         # Use provided constraint name or default pattern: uk_<table>_<column>
+                        # Use provided constraint name or default pattern: uk_<table>_<column>
                         constraint_name = f"uk_{table_name}_{col_name}"
                         drop_stmt = f"ALTER TABLE {qualified_table} DROP CONSTRAINT IF EXISTS {constraint_name};"
                         alter_ops.append(drop_stmt)
@@ -101,7 +109,6 @@ def generate_sql(xml_file):
                     stmt += ";"
                     foreign_keys.append(stmt)
 
-
                 elif child.tag == 'addIndex':
                     index_name = child.attrib.get('name')
                     columns = child.attrib.get('columns')
@@ -131,32 +138,83 @@ def generate_sql(xml_file):
 
             # If we have any effective columns, generate a CREATE TABLE statement
             if effective_columns:
-                col_defs = ",\n    ".join(effective_columns.values())
+                col_defs = ",\n    ".join(c['def'] for c in effective_columns.values())
                 create_stmt = f"CREATE TABLE IF NOT EXISTS {qualified_table} (\n    {col_defs}\n);"
                 sql_statements.append(create_stmt)
+            
+            # Collect nohistory columns for trigger generation
+            nohistory_columns = [name for name, info in effective_columns.items() if info.get('nohistory')]
 
             # Append ALTER TABLE commands
             sql_statements.extend(alter_ops)
             # Append foreign key constraints
             sql_statements.extend(foreign_keys)
 
-            # If history logging is enabled, create the history table and triggers
+            # If history logging is enabled, create the history table and triggers.
             if is_history:
-                # Change from History_ to history_
                 hist_table = f"{ns}.history_{table_name}"
-                sql_statements.append(f"CREATE TABLE IF NOT EXISTS {hist_table} (")
-                sql_statements.append("    historyid SERIAL PRIMARY KEY,")
-                sql_statements.append("    changed_at TIMESTAMP WITH TIME ZONE DEFAULT now(),")
-                sql_statements.append("    operation CHAR(1),")
-                sql_statements.append("    historyjson jsonb")
-                sql_statements.append(");")
+                create_hist_stmt = [f"CREATE TABLE IF NOT EXISTS {hist_table} ("]
+                create_hist_stmt.append("    historyid SERIAL PRIMARY KEY,")
+                # Only add the primarykey column if a primary key is defined.
+                if primary_key_field:
+                    pk_field_type = primary_key_field[1]
+                    # Use INTEGER if the primary key type is SERIAL
+                    hist_pk_type = "INTEGER" if pk_field_type.upper() == "SERIAL" else pk_field_type
+                    create_hist_stmt.append(f"    primarykey {hist_pk_type},")
+                create_hist_stmt.append("    changed_at TIMESTAMP WITH TIME ZONE DEFAULT now(),")
+                create_hist_stmt.append("    operation CHAR(1),")
+                create_hist_stmt.append("    historyjson jsonb")
+                create_hist_stmt.append(");")
+                sql_statements.extend(create_hist_stmt)
+                
+                # If a primary key was defined, also ensure the column exists (in case of an existing table)
+                if primary_key_field:
+                    pk_field_type = primary_key_field[1]
+                    hist_pk_type = "INTEGER" if pk_field_type.upper() == "SERIAL" else pk_field_type
+                    sql_statements.append(f"ALTER TABLE {hist_table} ADD COLUMN IF NOT EXISTS primarykey {hist_pk_type} NULL;")
 
-                # Generate a trigger function that logs changes into the historyjson column
+                # Generate a trigger function that logs changes into the history table without using casting.
+                # Build the nohistory exclusion condition for UPDATE
+                if nohistory_columns:
+                    skip_cols_array = "ARRAY[" + ", ".join(f"'{c}'" for c in nohistory_columns) + "]"
+                    skip_condition = f"AND NOT (key = ANY({skip_cols_array}))"
+                else:
+                    skip_condition = ""
+                
                 trigger_function_sql = f'''CREATE OR REPLACE FUNCTION log_history_{table_name}() RETURNS trigger AS $$
 DECLARE
     changes jsonb := '{{}}';
     key text;
 BEGIN
+'''
+                if primary_key_field:
+                    pk_col = primary_key_field[0]
+                    trigger_function_sql += f'''
+    IF (TG_OP = 'INSERT') THEN
+         INSERT INTO {hist_table} (primarykey, historyjson, changed_at, operation)
+         VALUES (NEW.{pk_col}, to_jsonb(NEW), now(), 'I');
+         RETURN NEW;
+    ELSIF (TG_OP = 'DELETE') THEN
+         INSERT INTO {hist_table} (primarykey, historyjson, changed_at, operation)
+         VALUES (OLD.{pk_col}, to_jsonb(OLD), now(), 'D');
+         RETURN OLD;
+    ELSIF (TG_OP = 'UPDATE') THEN
+         FOR key IN SELECT jsonb_object_keys(to_jsonb(NEW)) LOOP
+            IF to_jsonb(NEW)->key IS DISTINCT FROM to_jsonb(OLD)->key {skip_condition} THEN
+                changes = changes || jsonb_build_object(key, to_jsonb(NEW)->key);
+            END IF;
+         END LOOP;
+         IF changes = '{{}}'::jsonb THEN
+             RETURN NEW;
+         ELSE
+             INSERT INTO {hist_table} (primarykey, historyjson, changed_at, operation)
+             VALUES (NEW.{pk_col}, changes, now(), 'U');
+             RETURN NEW;
+         END IF;
+    END IF;
+'''
+                else:
+                    trigger_function_sql += f'''
     IF (TG_OP = 'INSERT') THEN
          INSERT INTO {hist_table} (historyjson, changed_at, operation)
          VALUES (to_jsonb(NEW), now(), 'I');
@@ -167,14 +225,20 @@ BEGIN
          RETURN OLD;
     ELSIF (TG_OP = 'UPDATE') THEN
          FOR key IN SELECT jsonb_object_keys(to_jsonb(NEW)) LOOP
-             IF to_jsonb(NEW)->key IS DISTINCT FROM to_jsonb(OLD)->key THEN
+             IF to_jsonb(NEW)->key IS DISTINCT FROM to_jsonb(OLD)->key {skip_condition} THEN
                 changes = changes || jsonb_build_object(key, to_jsonb(NEW)->key);
              END IF;
          END LOOP;
-         INSERT INTO {hist_table} (historyjson, changed_at, operation)
-         VALUES (changes, now(), 'U');
-         RETURN NEW;
+         IF changes = '{{}}'::jsonb THEN
+             RETURN NEW;
+         ELSE
+             INSERT INTO {hist_table} (historyjson, changed_at, operation)
+             VALUES (changes, now(), 'U');
+             RETURN NEW;
+         END IF;
     END IF;
+'''
+                trigger_function_sql += '''
     RETURN NULL;
 END;
 $$ LANGUAGE plpgsql;'''
@@ -190,10 +254,9 @@ $$ LANGUAGE plpgsql;'''
                 continue
             ns = command.attrib.get('namespace', 'public')
             qualified_table = f"{ns}.{table_name}"
-            # Change from History_ to history_
             hist_table = f"{ns}.history_{table_name}"
             sql_statements.append(f"DROP TABLE IF EXISTS {qualified_table};")
-            #note: dont delete history automatically.
+            # Note: Do not delete the history table automatically.
             # sql_statements.append(f"DROP TABLE IF EXISTS {hist_table};")        
         else:
             sys.stderr.write(f"Warning: Unrecognized top-level element '{command.tag}'.\n")
@@ -201,6 +264,7 @@ $$ LANGUAGE plpgsql;'''
     # End transaction
     sql_statements.append("COMMIT;")
     return "\n\n".join(sql_statements)
+
 def save_to_file(content, output_file):
     try:
         with open(output_file, 'w') as f:

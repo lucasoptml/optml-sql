@@ -1,0 +1,60 @@
+<commands xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="schema.xsd">
+
+    <!-- add uuid generate support -->
+    <createExtension name="uuid-ossp" />
+    
+    <addTable name="user" history="false">
+        <addColumn name="id" type="text" primaryKey="true" />
+        <addColumn name="name" type="text" nullable="false" />
+        <addColumn name="email" type="text" nullable="false" unique="true" />
+    
+        <addIndex name="user_email" columns="email" />
+
+    </addTable>
+
+    <addTable name="account" history="true">
+        <addColumn name="id" type="text" primaryKey="true" />
+
+        <addForeignKey column="user_id" 
+                   refTable="public.user" 
+                   refColumn="id"
+                   />
+
+    </addTable>
+
+    <!-- history true creates audit tables that use jsonb diffs to store change tracking -->
+    <addTable name="projects" history="true">
+        <addColumn name="projectid" type="bigint generated always as identity" primaryKey="true" />
+        <addColumn name="projectuuid" type="uuid" default="uuid_generate_v4()" unique="true" />
+        
+        <addColumn name="name" type="text" />
+        <addColumn name="description" type="text" />
+
+        <addColumn name="userid" type="text" />
+        
+        <addForeignKey column="userid" 
+                   refTable="public.user" 
+                   refColumn="id"
+                 />
+
+        <addColumn name="createdate" type="timestamp with time zone" default="now()" />
+
+        <addColumn name="infojson" type="jsonb" nullable="true" />
+
+        <addIndex name="projects_projectuuid" columns="projectuuid" />
+        <addIndex name="projects_userid" columns="userid" />
+        
+        <!-- drop a column and not in the history mirror
+        <removeColumn name="description" />
+        -->
+
+    </addTable>
+
+
+    <!-- Drop an existing table and (not) its history mirror
+    <removeTable name="old_table" />
+     -->
+
+
+</commands>
